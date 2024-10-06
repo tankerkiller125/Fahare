@@ -13,3 +13,13 @@ any-death: false
 
 # How many lives a player should have before they are considered dead.
 lives: 1
+
+# Should players be set to spectator mode when they have lived all their lives?  
+spectate-when-dead: true
+
+# How long to ban players for upon death in seconds.
+# Set to 0 to disable banning.
+ban-time: 0
+
+# When the last reset occurred. Do not modify this value unless you know what you're doing.
+last-reset: 0

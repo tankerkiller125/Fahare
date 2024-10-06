@@ -13,6 +13,9 @@ import net.kyori.adventure.translation.TranslationRegistry;
 import net.kyori.adventure.util.UTF8ResourceBundleControl;
 import org.bukkit.*;
 import org.bukkit.command.CommandSender;
+import org.bukkit.configuration.ConfigurationSection;
+import org.bukkit.configuration.file.FileConfiguration;
+import org.bukkit.configuration.file.YamlConfiguration;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
@@ -27,8 +30,11 @@ import org.bukkit.plugin.java.JavaPlugin;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
+import java.io.File;
+import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.time.LocalDate;
 import java.util.*;
 import java.util.stream.Collectors;
@@ -39,6 +45,7 @@ import static net.kyori.adventure.text.Component.translatable;
 
 public final class Fahare extends JavaPlugin implements Listener {
 
+    private static final boolean isFolia = Bukkit.getVersion().contains("Folia");
     private static final NamespacedKey REAL_OVERWORLD_KEY = NamespacedKey.minecraft("overworld");
     private static final Random RANDOM = new Random();
     private final NamespacedKey fakeOverworldKey = new NamespacedKey(this, "overworld");
@@ -52,7 +59,16 @@ public final class Fahare extends JavaPlugin implements Listener {
     private boolean backup = true;
     private boolean autoReset = true;
     private boolean anyDeath = false;
+    private boolean spectateWhenDead = false;
     private int lives = 1;
+    private Duration banTime = Duration.ZERO;
+    private long lastReset = 0;
+    
+    private final File dataFile = new File(getDataFolder(), "data.yml");
+    FileConfiguration dataConfig = YamlConfiguration.loadConfiguration(dataFile);
+    private final Map<String, Integer> playerDeaths = new HashMap<>();
+    private final Map<String, Long> playerLastLogin = new HashMap<>();
+    
 
     private static @NotNull World overworld() {
         return Objects.requireNonNull(Bukkit.getWorld(REAL_OVERWORLD_KEY), "Overworld not found");
@@ -101,6 +117,7 @@ public final class Fahare extends JavaPlugin implements Listener {
         WorldCreator creator = new WorldCreator(limboWorldKey)
                 .type(WorldType.FLAT)
                 .generateStructures(false)
+                .hardcore(true)
                 .generatorSettings("{\"biome\":\"minecraft:the_end\",\"layers\":[{\"block\":\"minecraft:air\",\"height\":1}]}");
         limboWorld = creator.createWorld();
 
@@ -128,6 +145,21 @@ public final class Fahare extends JavaPlugin implements Listener {
                         c.getSender().sendMessage(translatable("fhr.chat.resetting"));
                         reset();
                     }));
+            
+            commandManager.command(cmd
+                    .literal("reload")
+                    .permission("fahare.reload")
+                    .handler(c -> {
+                        loadConfig();
+                        c.getSender().sendMessage(translatable("fhr.chat.reloaded"));
+                    }));
+            
+            commandManager.command(cmd.literal("lives")
+                    .permission("fahare.lives")
+                    .handler(c -> {
+                        var lives = playerDeaths.get(getServer().getPlayerUniqueId(c.getSender().getName()));
+                        c.getSender().sendMessage(translatable("fhr.chat.lives", lives.toString()));
+                    }));
 
             // Exception handler
             new MinecraftExceptionHandler<CommandSender>()
@@ -140,31 +172,64 @@ public final class Fahare extends JavaPlugin implements Listener {
 
         // Register events and tasks
         Bukkit.getPluginManager().registerEvents(this, this);
-        Bukkit.getScheduler().runTaskTimer(this, () -> {
-            // Teleport players from real overworld
-            Location destination = fakeOverworld.getSpawnLocation();
-            for (Player player : overworld().getPlayers()) {
-                player.teleport(destination);
-            }
-        }, 1, 1);
+        if (isFolia) {
+            Bukkit.getGlobalRegionScheduler().runAtFixedRate(this, (test) -> {
+                // Teleport players from fake overworld
+                Location destination = overworld().getSpawnLocation();
+                for (Player player : fakeOverworld.getPlayers()) {
+                    player.teleport(destination);
+                }
+            }, 1, 1);
+        } else {
+            Bukkit.getScheduler().runTaskTimer(this, () -> {
+                // Teleport players from real overworld
+                Location destination = fakeOverworld.getSpawnLocation();
+                for (Player player : overworld().getPlayers()) {
+                    player.teleport(destination);
+                }
+            }, 1, 1);
+        }
     }
 
     private void loadConfig() {
         saveDefaultConfig();
         reloadConfig();
+        try {
+            if (!dataFile.exists()) {
+                dataFile.createNewFile();
+            }
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
         var config = getConfig();
         backup = config.getBoolean("backup", backup);
         autoReset = config.getBoolean("auto-reset", autoReset);
         anyDeath = config.getBoolean("any-death", anyDeath);
         lives = Math.max(1, config.getInt("lives", lives));
+        banTime = Duration.ofSeconds(config.getInt("ban-time", 0));
+        lastReset = config.getLong("last-reset", lastReset);
+        spectateWhenDead = config.getBoolean("spectate-when-dead", true);
     }
 
     public int getDeathsFor(UUID player) {
-        return deaths.getOrDefault(player, 0);
+        if (dataConfig.isConfigurationSection("deaths")) {
+            ConfigurationSection deaths = dataConfig.getConfigurationSection("deaths");
+            if (deaths != null) {
+                for (String key : deaths.getKeys(false)) {
+                    playerDeaths.put(key, deaths.getInt(key));
+                }
+            }
+        }
+        return playerDeaths.get(player.toString()) == null ? 0 : playerDeaths.get(player.toString());
     }
 
     public void addDeathTo(UUID player) {
-        deaths.put(player, getDeathsFor(player)+1);
+        playerDeaths.put(player.toString(), getDeathsFor(player) + 1);
+        dataConfig.createSection("deaths", playerDeaths);
+        try {
+            dataConfig.save(dataFile);
+        } catch (Exception ignored) {
+        }
     }
 
     public boolean isDead(UUID player) {
@@ -190,12 +255,16 @@ public final class Fahare extends JavaPlugin implements Listener {
 
         // check if worlds are ticking
         if (Bukkit.isTickingWorlds()) {
-            Bukkit.getScheduler().runTaskLater(this, () -> deleteNextWorld(worlds, backupDestination), 1);
+            if (isFolia) {
+                Bukkit.getGlobalRegionScheduler().runDelayed(this, test -> {deleteNextWorld(worlds, backupDestination);}, 1);
+            } else {
+                Bukkit.getScheduler().runTaskLater(this, () -> deleteNextWorld(worlds, backupDestination), 1);
+            }
             return;
         }
 
         // get world data
-        World world = worlds.remove(0);
+        World world = worlds.removeFirst();
         String worldName = world.getName();
         Component worldKey = text(worldName);
         WorldCreator creator = new WorldCreator(worldName, world.getKey());
@@ -217,6 +286,7 @@ public final class Fahare extends JavaPlugin implements Listener {
                 }
 
                 // create new world
+                creator.hardcore(true);
                 creator.createWorld();
                 Bukkit.getServer().sendMessage(translatable("fhr.chat.success", worldKey));
             } catch (Exception e) {
@@ -228,7 +298,11 @@ public final class Fahare extends JavaPlugin implements Listener {
             Bukkit.getServer().sendMessage(translatable("fhr.chat.error", NamedTextColor.RED, worldKey));
         }
 
-        Bukkit.getScheduler().runTaskLater(this, () -> deleteNextWorld(worlds, backupDestination), 1);
+        if (isFolia) {
+            Bukkit.getGlobalRegionScheduler().runDelayed(this, test -> {deleteNextWorld(worlds, backupDestination);}, 1);
+        } else {
+            Bukkit.getScheduler().runTaskLater(this, () -> deleteNextWorld(worlds, backupDestination), 1);
+        }
     }
 
     public synchronized void reset() {
@@ -237,6 +311,13 @@ public final class Fahare extends JavaPlugin implements Listener {
         if (limboWorld == null)
             return;
         deaths.clear();
+        dataConfig.set("deaths", null);
+        playerDeaths.clear();
+        playerLastLogin.clear();
+        try {
+            dataConfig.save(dataFile);
+        } catch (Exception ignored) {
+        }
         // teleport all players to limbo
         Location destination = new Location(limboWorld, 0, 100, 0);
         for (Player player : Bukkit.getOnlinePlayers()) {
@@ -250,9 +331,16 @@ public final class Fahare extends JavaPlugin implements Listener {
             player.setFoodLevel(20);
             player.setSaturation(5);
         }
+        var config = getConfig();
+        config.set("last-reset", System.currentTimeMillis());
+        saveConfig();
         // check if worlds are ticking
         if (Bukkit.isTickingWorlds()) {
-            Bukkit.getScheduler().runTaskLater(this, this::reset, 1);
+            if (isFolia) {
+                Bukkit.getGlobalRegionScheduler().runDelayed(this, test -> {reset();}, 1);
+            } else {
+                Bukkit.getScheduler().runTaskLater(this, this::reset, 1);
+            }
             return;
         }
         resetting = true;
@@ -286,27 +374,64 @@ public final class Fahare extends JavaPlugin implements Listener {
             reset();
             return;
         }
-        Collection<? extends Player> players = Bukkit.getOnlinePlayers();
-        if (players.isEmpty())
-            return;
-        for (Player player : players) {
-            if (isAlive(player.getUniqueId()))
+        @NotNull OfflinePlayer[] offlinePlayers = Bukkit.getServer().getOfflinePlayers();
+        for (@NotNull OfflinePlayer offlinePlayer : offlinePlayers) {
+            if (isAlive(offlinePlayer.getUniqueId()) && offlinePlayer.getLastSeen() >= System.currentTimeMillis() - 1000 * 60 * 60 * 24 * 7)
                 return;
         }
         reset();
     }
 
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onResponse(PlayerRespawnEvent event) {
+        Player player = event.getPlayer();
+        if (isFolia) {
+            Bukkit.getGlobalRegionScheduler().runDelayed(this, test -> {
+                if (isAlive(player.getUniqueId()) || !spectateWhenDead) {
+                    player.setGameMode(GameMode.SURVIVAL);
+                }
+            }, 2);
+        } else {
+            Bukkit.getScheduler().runTaskLater(this, () -> {
+                if (isAlive(player.getUniqueId()) || !spectateWhenDead) {
+                    player.setGameMode(GameMode.SURVIVAL);
+                }
+            }, 2);
+        }
+    }
+    
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onDeath(PlayerDeathEvent event) {
         Player player = event.getEntity();
         addDeathTo(player.getUniqueId());
+        if (!banTime.isZero()) {
+            player.getInventory().clear();
+            player.getEnderChest().clear();
+            player.setLevel(0);
+            player.setExp(0);
+            player.setHealth(20);
+            player.setFoodLevel(20);
+            player.setSaturation(5);
+        }
         if (isAlive(player.getUniqueId()))
             return;
-        Bukkit.getScheduler().runTaskLater(this, () -> {
-            player.setGameMode(GameMode.SPECTATOR);
-            player.spigot().respawn();
-            resetCheck(true);
-        }, 1);
+        
+        if (isFolia) {
+            Bukkit.getGlobalRegionScheduler().runDelayed(this, test -> {
+                player.spigot().respawn();
+                player.setGameMode(GameMode.SURVIVAL);
+                resetCheck(true);
+            }, 1);
+        } else {
+            Bukkit.getScheduler().runTaskLater(this, () -> {
+                player.spigot().respawn();
+                player.setGameMode(GameMode.SURVIVAL);
+                resetCheck(true);
+            }, 1);
+        }
+        if (banTime.isPositive()) {
+            player.ban("You have died. Come back later.", banTime, "Hardcore");
+        }
     }
 
     @EventHandler(priority = EventPriority.LOWEST)
@@ -343,8 +468,43 @@ public final class Fahare extends JavaPlugin implements Listener {
     @EventHandler(priority = EventPriority.LOWEST)
     public void onPlayerJoin(PlayerJoinEvent event) {
         Player player = event.getPlayer();
-        if (player.getWorld().getKey().equals(REAL_OVERWORLD_KEY))
+        if (dataConfig.isConfigurationSection("logins")) {
+            ConfigurationSection playerLogins = dataConfig.getConfigurationSection("logins");
+            if (playerLogins != null) {
+                for (String key : playerLogins.getKeys(false)) {
+                    playerLastLogin.put(key, playerLogins.getLong(key));
+                }
+            }
+        }
+        
+        
+        if (!playerLastLogin.containsKey(player.getUniqueId().toString())) {
+            playerLastLogin.put(player.getUniqueId().toString(), Bukkit.getOfflinePlayer(player.getUniqueId()).getLastLogin());
+        }
+        
+        // If the player last logged in before the last reset, reset the player
+        if(playerLastLogin.get(player.getUniqueId().toString()) < lastReset) {
+            player.getInventory().clear();
+            player.getEnderChest().clear();
+            player.setLevel(0);
+            player.setExp(0);
+            player.setHealth(20);
+            player.setFoodLevel(20);
+            player.setSaturation(5);
             player.teleport(fakeOverworld().getSpawnLocation());
+        }
+        
+        playerLastLogin.put(player.getUniqueId().toString(), Bukkit.getOfflinePlayer(player.getUniqueId()).getLastLogin());
+        dataConfig.createSection("logins", playerLastLogin);
+        try {
+            dataConfig.save(dataFile);
+        } catch (Exception ignored) {
+        }
+        
+        if (player.getWorld().getKey().equals(REAL_OVERWORLD_KEY)) {
+            player.teleport(fakeOverworld().getSpawnLocation());
+        }
+        
     }
 
     @EventHandler(priority = EventPriority.LOWEST)
